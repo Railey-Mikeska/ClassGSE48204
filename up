@@ -1,0 +1,1465 @@
+
+
+# install packages 
+if (!requireNamespace("GEOquery", quietly = TRUE))
+  install.packages("GEOquery")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+#Install libraries
+library(GEOquery)
+library(tidyverse)
+library(limma)
+library(tibble)         # for rownames_to_column / column_to_rownames
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# ---- 1. Load GSE48204 (fetch expression + metadata) ----
+gse <- getGEO("GSE48204", GSEMatrix = TRUE)
+exprset <- gse[[1]]   # main ExpressionSet
+
+# ---- 2. Extract sample metadata ----
+metadata_raw <- pData(exprset)
+
+# Create metadata tibble with conditions
+metadata <- metadata_raw %>%
+  as_tibble(rownames = "gsm_id") %>%
+  mutate(
+    condition = case_when(
+      str_detect(title, "Control") ~ "Control",
+      str_detect(title, "withdraw") ~ "Withdraw13d",
+      str_detect(title, "11 days") ~ "TGFb11d",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(condition)) %>%
+  group_by(condition) %>%
+  mutate(rep = row_number()) %>%
+  ungroup()
+
+
+
+# ---- 3. Extract expression matrix ----
+expr_mat <- exprs(exprset)
+
+# Match columns to metadata order
+expr_mat <- expr_mat[, metadata$gsm_id]
+
+# ---- 4. Map probe IDs to gene symbols ----
+if (!requireNamespace("mouse4302.db", quietly = TRUE))
+  BiocManager::install("mouse4302.db")
+
+library(mouse4302.db)
+library(AnnotationDbi)
+
+probe2gene <- AnnotationDbi::select(
+  mouse4302.db,
+  keys = rownames(expr_mat),
+  columns = c("SYMBOL"),
+  keytype = "PROBEID"
+)
+
+expr_mat_gene <- expr_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("PROBEID") %>%
+  left_join(probe2gene, by = "PROBEID") %>%
+  filter(!is.na(SYMBOL)) %>%
+  group_by(SYMBOL) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  column_to_rownames("SYMBOL")
+
+# ---- 5. Differential expression using limma ----
+library(limma)
+
+design <- model.matrix(~0 + factor(metadata$condition))
+colnames(design) <- levels(factor(metadata$condition))
+
+fit <- lmFit(expr_mat_gene, design)
+contrast.matrix <- makeContrasts(
+  TGFb11d_vs_Control = TGFb11d - Control,
+  Withdraw13d_vs_Control = Withdraw13d - Control,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+library(dplyr)
+
+# ---- TGFβ ----
+top_genes_TGFb <- topTable(fit2, coef = "TGFb11d_vs_Control", number = Inf, adjust.method = "fdr") %>%
+  rownames_to_column(var = "Gene")
+
+# Top 20 upregulated (logFC > 0)
+top_TGFb_up <- top_genes_TGFb %>%
+  filter(adj.P.Val < 0.05, logFC > 0) %>%
+  arrange(desc(logFC)) %>%
+  head(20)
+
+# Top 20 downregulated (logFC < 0)
+top_TGFb_down <- top_genes_TGFb %>%
+  filter(adj.P.Val < 0.05, logFC < 0) %>%
+  arrange(logFC) %>%
+  head(20)
+
+# ---- Withdraw ----
+top_genes_Withdraw <- topTable(fit2, coef = "Withdraw13d_vs_Control", number = Inf, adjust.method = "fdr")
+
+top_Withdraw_up <- top_genes_Withdraw %>%
+  filter(adj.P.Val < 0.05, logFC > 0) %>%
+  arrange(desc(logFC)) %>%
+  head(20)
+
+top_Withdraw_down <- top_genes_Withdraw %>%
+  filter(adj.P.Val < 0.05, logFC < 0) %>%
+  arrange(logFC) %>%
+  head(20)
+
+
+
+
+# ---- Volcano plot for TGFb (11d vs Control) and tubulin genes----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_TGFb <- top_genes_TGFb %>%
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_TGFb <- volcano_TGFb %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  dplyr::slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+
+# Make both uppercase
+volcano_TGFb <- volcano_TGFb %>%
+  mutate(Gene_upper = toupper(Gene))
+
+
+
+# ---- Volcano plot ----
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# Split tubulin genes into Tubb3 vs the rest
+tubulin_other <- setdiff(tubulin_genes, "Tubb3")
+
+ggplot(volcano_TGFb, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  # Base points
+  geom_point(alpha = 0.6, size = 1.8) +
+  
+  # Color mapping for up/down/not significant
+  scale_color_manual(values = c(
+    "Upregulated" = "#E64B35",
+    "Downregulated" = "#377EB8",  # softer blue
+    "Not significant" = "grey80"
+  )) +
+  
+  # Threshold lines
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_TGFb,
+    aes(label = Gene),
+    size = 4,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Tubulin genes (transparent circles with black outline)
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_other),
+    shape = 21,
+    color = "black",
+    fill = NA,
+    size = 4,
+    stroke = 1
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_other),
+    aes(label = Gene),
+    size = 6,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight Tubb3 (solid black circle)
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene == "Tubb3"),
+    shape = 21,
+    color = "black",
+    fill = "black",
+    size = 4
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene == "Tubb3"),
+    aes(label = Gene),
+    size = 6,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Labels
+  labs(
+    title = "Volcano Plot: TGFβ (11d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  
+  # Theme
+  cowplot::theme_cowplot() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 12)
+  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---- Volcano plot for TGFb (11d vs Control) and GO:0015630 microtubule cytoskeleton genes----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_TGFb <- top_genes_TGFb %>%
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_TGFb <- volcano_TGFb %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  dplyr::slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0015630 microtubule cytoskeleton genes ----
+go_mt_genes_0015630 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0015630",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_TGFb <- volcano_TGFb %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0015630_vector <- toupper(go_mt_genes_0015630$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_TGFb, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_TGFb,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 30,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0015630_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0015630_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: TGFβ (11d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+# ---- Volcano plot for TWithdraw (13d vs Control) and GO:0015630 microtubule cytoskeleton genes----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_Withdraw <- top_genes_Withdraw %>%
+  rownames_to_column(var = "Gene") %>%   # convert rownames to a column
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1  ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    ),
+    Gene_upper = toupper(Gene)  # now this will work
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_Withdraw <- volcano_Withdraw %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0015630 microtubule cytoskeleton genes ----
+go_mt_genes_0015630 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0015630",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_Withdraw <- volcano_Withdraw %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0015630_vector <- toupper(go_mt_genes_0015630$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_Withdraw, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_Withdraw,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 30,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0015630_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0015630_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: Withdraw (13d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+
+###
+
+
+
+
+# ---- Volcano plot for TGFb (11d vs Control) and GO:0030981 cortical microtubule cytoskeleton----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_TGFb <- top_genes_TGFb %>%
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_TGFb <- volcano_TGFb %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  dplyr::slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0030981 microtubule cytoskeleton genes ----
+go_mt_genes_0030981 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0030981",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_TGFb <- volcano_TGFb %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0030981_vector <- toupper(go_mt_genes_0030981$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_TGFb, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_TGFb,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0030981_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0030981_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: TGFβ (11d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+
+
+
+
+# ---- Volcano plot for Withdraw (13d vs Control) and GO:0030981 cortical microtubule cytoskeleton----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_Withdraw <- top_genes_Withdraw %>%
+  rownames_to_column(var = "Gene") %>%   # convert rownames to a column
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1  ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    ),
+    Gene_upper = toupper(Gene)  # now this will work
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_Withdraw <- volcano_Withdraw %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0030981 microtubule cytoskeleton genes ----
+go_mt_genes_0030981 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0030981",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_Withdraw <- volcano_Withdraw %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0030981_vector <- toupper(go_mt_genes_0030981$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_Withdraw, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_Withdraw,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0030981_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0030981_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: Withdraw (13d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+###
+
+
+
+# ---- Volcano plot for TGFb (11d vs Control) and GO:0002177 manchette----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_TGFb <- top_genes_TGFb %>%
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_TGFb <- volcano_TGFb %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  dplyr::slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0002177 microtubule cytoskeleton genes ----
+go_mt_genes_0002177 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0002177",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_TGFb <- volcano_TGFb %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0002177_vector <- toupper(go_mt_genes_0002177$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_TGFb, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_TGFb,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0002177_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0002177_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: TGFβ (11d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+
+
+
+
+# ---- Volcano plot for Withdraw (13d vs Control) and GO:0002177 manchette----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_Withdraw <- top_genes_Withdraw %>%
+  rownames_to_column(var = "Gene") %>%   # convert rownames to a column
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1  ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    ),
+    Gene_upper = toupper(Gene)  # now this will work
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_Withdraw <- volcano_Withdraw %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0030981 microtubule cytoskeleton genes ----
+go_mt_genes_0002177 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0002177",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_Withdraw <- volcano_Withdraw %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0002177_vector <- toupper(go_mt_genes_0002177$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_Withdraw, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_Withdraw,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0002177_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0002177_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: Withdraw (13d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+
+#####
+
+
+
+# ---- Volcano plot for TGFb (11d vs Control) and GO:0005874 microtubule----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_TGFb <- top_genes_TGFb %>%
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_TGFb <- volcano_TGFb %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  dplyr::slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0005874 microtubule cytoskeleton genes ----
+go_mt_genes_0005874 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0005874",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_TGFb <- volcano_TGFb %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0005874_vector <- toupper(go_mt_genes_0005874$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_TGFb, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_TGFb,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0005874_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0005874_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: TGFβ (11d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+
+
+
+# ---- Volcano plot for Withdraw (13d vs Control) and GO:0002177 manchette----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_Withdraw <- top_genes_Withdraw %>%
+  rownames_to_column(var = "Gene") %>%   # convert rownames to a column
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1  ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    ),
+    Gene_upper = toupper(Gene)  # now this will work
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_Withdraw <- volcano_Withdraw %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0005874 microtubule cytoskeleton genes ----
+go_mt_genes_0005874 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0005874",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_Withdraw <- volcano_Withdraw %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0005874_vector <- toupper(go_mt_genes_0005874$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_Withdraw, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_Withdraw,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0005874_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0005874_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: Withdraw (13d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+### GO:0005875
+
+
+# ---- Volcano plot for TGFb (11d vs Control) and GO:0005875 microtubule associated complex----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_TGFb <- top_genes_TGFb %>%
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_TGFb <- volcano_TGFb %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  dplyr::slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0005874 microtubule cytoskeleton genes ----
+go_mt_genes_0005875 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0005875",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_TGFb <- volcano_TGFb %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0005875_vector <- toupper(go_mt_genes_0005875$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_TGFb, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_TGFb,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0005875_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_TGFb %>% filter(Gene_upper %in% go_mt_genes_0005875_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: TGFβ (11d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+
+
+
+# ---- Volcano plot for Withdraw (13d vs Control) and GO:0002177 manchette----
+library(ggplot2)
+library(ggrepel)
+
+# Add significance and direction
+volcano_Withdraw <- top_genes_Withdraw %>%
+  rownames_to_column(var = "Gene") %>%   # convert rownames to a column
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1  ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    ),
+    Gene_upper = toupper(Gene)  # now this will work
+  )
+
+# ---- Highlight top genes (by |logFC|) ----
+top_labels_Withdraw <- volcano_Withdraw %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 10)
+
+# ---- Tubulin genes ----
+tubulin_genes <- c(
+  "Tubb1", "Tubb2a", "Tubb2b", "Tubb3", "Tubb4", "Tubb5", "Tubb6",
+  "Tuba1a", "Tuba1b", "Tuba1c", "Tuba3a", "Tuba4a", "Tuba8"
+)
+
+# ---- GO:0005874 microtubule cytoskeleton genes ----
+go_mt_genes_0005875 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0005875",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+
+# Make both uppercase
+volcano_Withdraw <- volcano_Withdraw %>%
+  mutate(Gene_upper = toupper(Gene))
+
+# Extract gene symbols for matching
+go_mt_genes_0005875_vector <- toupper(go_mt_genes_0005875$SYMBOL)
+
+
+
+# ---- Volcano plot ----
+# Volcano plot
+ggplot(volcano_Withdraw, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # Top labels
+  geom_text_repel(
+    data = top_labels_Withdraw,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  
+  # Highlight tubulin genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    color = "green", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene %in% tubulin_genes),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  # Highlight GO microtubule cytoskeleton genes
+  geom_point(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0005875_vector),
+    color = "purple", size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_Withdraw %>% filter(Gene_upper %in% go_mt_genes_0005875_vector),
+    aes(label = Gene),
+    size = 5,
+    nudge_y = 0.5,
+    color = "black"
+  ) +
+  
+  labs(
+    title = "Volcano Plot: Withdraw (13d vs Control, tubulin & GO microtubule genes highlighted)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---- Microtubule-specific for TGFb and Withdraw ----
+
+library(clusterProfiler)
+library(enrichplot)
+library(msigdbr)
+library(tidyverse)
+
+# ---- 1. Load microtubule GO gene sets (C5) ----
+microtubule_genes <- msigdbr(species = "Mus musculus") %>%
+  dplyr::filter(gs_collection == "C5",      # C5 = GO gene sets
+                str_detect(gs_name, "MICROTUBULE"))
+
+# ---- 2. Prepare ranked gene lists ----
+# TGFb
+rankedgenes_TGFb <- top_genes_TGFb$logFC
+names(rankedgenes_TGFb) <- rownames(top_genes_TGFb)
+rankedgenes_TGFb <- sort(rankedgenes_TGFb, decreasing = TRUE)
+rankedgenes_TGFb <- rankedgenes_TGFb[!duplicated(names(rankedgenes_TGFb))]
+
+# Withdraw
+rankedgenes_Withdraw <- top_genes_Withdraw$logFC
+names(rankedgenes_Withdraw) <- rownames(top_genes_Withdraw)
+rankedgenes_Withdraw <- sort(rankedgenes_Withdraw, decreasing = TRUE)
+rankedgenes_Withdraw <- rankedgenes_Withdraw[!duplicated(names(rankedgenes_Withdraw))]
+
+# ---- 3. Run GSEA ----
+gsea_microtub_TGFb <- GSEA(
+  geneList = rankedgenes_TGFb,
+  TERM2GENE = microtubule_genes %>% dplyr::select(gs_name, gene_symbol),
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 0.05,
+  minGSSize = 5,
+  maxGSSize = 500
+)
+
+gsea_microtub_Withdraw <- GSEA(
+  geneList = rankedgenes_Withdraw,
+  TERM2GENE = microtubule_genes %>% dplyr::select(gs_name, gene_symbol),
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 0.05,
+  minGSSize = 5,
+  maxGSSize = 500
+)
+
+# ---- 4. Plot top microtubule gene set ----
+# Pick first microtubule gene set as example
+top_microtubule_set <- microtubule_genes$gs_name[1]
+
+# TGFb
+gseaplot(gsea_microtub_TGFb, geneSetID = top_microtubule_set)
+
+# Withdraw
+gseaplot(gsea_microtub_Withdraw, geneSetID = top_microtubule_set)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#--All GO gene sets---#
+# ---- 1. Load all GO gene sets ----
+all_go_genes <- msigdbr(species = "Mus musculus") %>%
+  dplyr::filter(gs_collection == "C5") %>%        # all GO sets
+  dplyr::select(gs_name, gene_symbol)
+
+
+
+# ---- 2. Prepare ranked gene lists ----
+# TGFb
+rankedgenes_TGFb <- top_genes_TGFb$logFC
+names(rankedgenes_TGFb) <- rownames(top_genes_TGFb)
+rankedgenes_TGFb <- sort(rankedgenes_TGFb, decreasing = TRUE)
+rankedgenes_TGFb <- rankedgenes_TGFb[!duplicated(names(rankedgenes_TGFb))]
+
+# Withdraw
+rankedgenes_Withdraw <- top_genes_Withdraw$logFC
+names(rankedgenes_Withdraw) <- rownames(top_genes_Withdraw)
+rankedgenes_Withdraw <- sort(rankedgenes_Withdraw, decreasing = TRUE)
+rankedgenes_Withdraw <- rankedgenes_Withdraw[!duplicated(names(rankedgenes_Withdraw))]
+
+# ---- 3. Run GSEA on all GO terms ----
+gsea_all_TGFb <- GSEA(
+  geneList = rankedgenes_TGFb,
+  TERM2GENE = all_go_genes %>% dplyr::select(gs_name, gene_symbol),
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 0.05,
+  minGSSize = 5,
+  maxGSSize = 500
+)
+
+gsea_all_Withdraw <- GSEA(
+  geneList = rankedgenes_Withdraw,
+  TERM2GENE = all_go_genes %>% dplyr::select(gs_name, gene_symbol),
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 0.05,
+  minGSSize = 5,
+  maxGSSize = 500
+)
+
+# ---- 4. Choose top GO terms ----
+# top positively enriched
+top_TGFb_pos <- gsea_all_TGFb@result %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = 3) %>%
+  pull(ID)
+
+top_TGFb_neg <- gsea_all_TGFb@result %>%
+  arrange(NES) %>%
+  slice_head(n = 3) %>%
+  pull(ID)
+
+top_Withdraw_pos <- gsea_all_Withdraw@result %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = 3) %>%
+  pull(ID)
+
+top_Withdraw_neg <- gsea_all_Withdraw@result %>%
+  arrange(NES) %>%
+  slice_head(n = 3) %>%
+  pull(ID)
+
+# ---- 5. Plot enrichment curves ----
+# Top enriched GO terms for TGFb
+lapply(top_TGFb_pos, function(term) gseaplot(gsea_all_TGFb, geneSetID = term))
+lapply(top_TGFb_neg, function(term) gseaplot(gsea_all_TGFb, geneSetID = term))
+
+# Top enriched GO terms for Withdraw
+lapply(top_Withdraw_pos, function(term) gseaplot(gsea_all_Withdraw, geneSetID = term))
+lapply(top_Withdraw_neg, function(term) gseaplot(gsea_all_Withdraw, geneSetID = term))
+
+
+
+
